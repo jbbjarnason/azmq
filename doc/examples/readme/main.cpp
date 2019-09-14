@@ -1,31 +1,184 @@
 #include <azmq/socket.hpp>
 #include <boost/asio.hpp>
+#include <boost/program_options.hpp>
 #include <array>
 #include <iostream>
 #include <type_traits>
-#include <experimental/filesystem>
+#include <fstream>
+#include <memory>
+#include <filesystem>
 #include <rapidjson/document.h>
+#include <nlohmann/json.hpp>
+#include <boost/bind.hpp>
+
 
 namespace asio = boost::asio;
-auto context = std::make_shared<asio::io_context>(1);
-
+namespace options = boost::program_options;
 #define PORT 7721
 
-template<class T>
-class TransmissionBase {
+
+class FileReader
+{
+    typedef std::shared_ptr<asio::streambuf> StreambufPtr;
+    typedef std::shared_ptr<FileReader> FileReaderPtr;
+    typedef std::weak_ptr<FileReader> FileReaderWeakPtr;
 public:
-    T getState() { return _lastState; }
-    T _lastState;
-protected:
+    static FileReaderWeakPtr Create(asio::io_service& io_service, const std::string& path);
+    virtual ~FileReader();
+
+    void HandleRead(FileReaderPtr me, StreambufPtr sb,
+                    const boost::system::error_code &error);
+private:
+    FileReader(asio::io_service& io_service, const std::string& path);
+    asio::posix::stream_descriptor m_InputStream;
 };
+
+FileReader::FileReaderWeakPtr FileReader::Create(asio::io_service& io_service,
+                                                 const std::string& path){
+    FileReaderPtr ptr(new FileReader(io_service, path));
+    StreambufPtr sb(new boost::asio::streambuf());
+
+    asio::async_read(ptr->m_InputStream, *sb,
+                     boost::bind(&FileReader::HandleRead, ptr.get(),
+                                 ptr, sb, asio::placeholders::error));
+    return ptr;
+}
+
+FileReader::FileReader(asio::io_service& io_service, const std::string& path)
+        :m_InputStream(io_service)
+{
+    int dev = open(path.c_str(), O_RDONLY);
+    if (dev == -1) {
+        throw std::runtime_error("failed to open device " + path);
+    }
+
+    m_InputStream.assign(dev);
+}
+
+void FileReader::HandleRead(FileReaderPtr me, StreambufPtr sb,
+                            const boost::system::error_code &error) {
+    if(!error) {
+        //Inform all of a sucessfull read
+        std::istream is(sb.get());
+        size_t data_length = sb->size();
+        asio::async_read(m_InputStream, *sb,
+                         boost::bind(&FileReader::HandleRead, this, me, sb, asio::placeholders::error));
+    }
+}
+
+// https://dakerfp.github.io/post/weak_ptr_singleton/
+class AppIO {
+private:
+    AppIO(): _ioContext(std::make_shared<asio::io_context>(1))
+    {
+    }
+    std::shared_ptr<asio::io_context> _ioContext;
+    std::string _appName;
+    std::string _appInstanceName;
+    std::shared_ptr<nlohmann::json> _config;
+    std::filesystem::path _cfgFile;
+
+    AppIO(const AppIO&) = delete;
+    void writeDefaultConfig(const std::filesystem::path& cfgFile) {
+        auto dirPath = cfgFile.parent_path();
+        if(!std::filesystem::exists(dirPath)) {
+            std::filesystem::create_directories(dirPath);
+        }
+
+        std::ofstream outCfg(cfgFile.string());
+        nlohmann::json j;
+        std::time_t result = std::time(nullptr);
+        j["_created"] = std::asctime(std::localtime(&result));
+        outCfg << j << std::endl;
+        outCfg.close();
+    }
+
+    nlohmann::json openConfig(const std::filesystem::path& cfgFile) {
+        nlohmann::json configAsJson;
+        std::ifstream inCfg(cfgFile.string());
+        inCfg >> configAsJson;
+        inCfg.close();
+        return configAsJson;
+    }
+
+    void initializeConfig() {
+        std::string home = getenv("HOME");
+        _cfgFile = home + "/.industry/config/" + getAppNameAndInstance() + ".json";
+        if (!std::filesystem::exists(_cfgFile)) {
+            writeDefaultConfig(_cfgFile);
+        }
+
+        _config = std::make_shared<nlohmann::json>(openConfig(_cfgFile));
+    }
+
+public:
+    ~AppIO() { }
+    static std::shared_ptr<AppIO> instance() {
+        static std::weak_ptr<AppIO> _instance;
+        // Todo: support multithread with mutex lock
+        if (auto ptr = _instance.lock()) { // .lock() returns a shared_ptr and increments the refcount
+            return ptr;
+        }
+        auto ptr = std::shared_ptr<AppIO>(new AppIO());
+        _instance = ptr;
+        return ptr;
+    }
+    std::shared_ptr<asio::io_context> getContext() {
+        return _ioContext;
+    }
+    const std::string& getAppName() {
+        return _appName;
+    }
+    const std::string& getInstanceAppName() {
+        return _appInstanceName;
+    }
+    const std::string getAppNameAndInstance() {
+        return _appName+"/"+_appInstanceName;
+    }
+    std::shared_ptr<nlohmann::json> getConfig() {
+        return _config;
+    }
+    void updateConfigFile() {
+        asio::posix::stream_descriptor out(*_ioContext);
+        auto path = _cfgFile.string();
+        int dev = open(path.c_str(), O_RDONLY);
+        if (dev == -1) throw std::runtime_error("failed to open device " + path);
+        out.assign(dev);
+
+        out.async_read_some()
+//        auto reader = FileReader::Create(*_ioContext, _cfgFile.string());
+    }
+    void initialize(int argc, char** argv) {
+        _appName = std::filesystem::path(argv[0]).filename();
+
+        options::options_description desc{"Options"};
+        desc.add_options()
+                ("help,h", "Help screen")
+                ("name,n", options::value<std::string>()->default_value("default"), "Application named used for configuration and data distribution topics");
+
+        options::variables_map vm;
+        options::store(parse_command_line(argc, argv, desc), vm);
+        options::notify(vm);
+
+
+        if (vm.count("help")) {
+            std::cout << desc << '\n';
+            exit(0);
+        }
+        _appInstanceName = vm["name"].as<std::string>();
+        std::cout << "Starting app: " << _appName << "." << _appInstanceName << '\n';
+
+        initializeConfig();
+    }
+};
+
 
 
 template<class T>
 class Receiver {
 public:
     typedef std::function<T(const std::string&)> toT;
-
-    Receiver(): _subscriber(*context) {
+    Receiver(std::string name): _subscriber(*AppIO::instance()->getContext()) {
         if (std::is_same<T, bool>::value) init(false, "bool", [this](const std::string & json){
             std::cout << "to json: " << json <<"\n";
             return parse(json)["val"].GetBool();
@@ -40,8 +193,22 @@ public:
             return parse(json)["val"].GetString();
         });
         else throw "Unknown type in sender declared in default constructor";
+        auto myApp = AppIO::instance();
+        _address = _typeName+"."+myApp->getAppName()+"."+myApp->getInstanceAppName()+"."+name;
+
+        auto conf = myApp->getConfig();
+        if (conf->find("_receivers") == conf->end()) {
+            (*conf)["_receivers"] = {};
+        }
+        if ((*conf)["_receivers"].find(_address) == (*conf)["_receivers"].end()) {
+            (*conf)["_receivers"][_address] = "";
+        }
+        auto connectedTo = (*conf)["_receivers"][_address];
+
+        myApp->updateConfigFile();
+        std::cout << "hahahahahahah";
     }
-    Receiver(T initalState, std::string typeName, const toT & toTemplateVal): _subscriber(*context) {
+    Receiver(T initalState, std::string typeName, const toT & toTemplateVal): _subscriber(*AppIO::instance()->getContext()) {
         init(initalState, typeName, toTemplateVal);
     }
 
@@ -64,6 +231,7 @@ public:
         });
     }
 
+    T getState() { return _lastState; }
 private:
     void init(T initialState, std::string typeName, const toT & toTemplateVal) {
         _lastState = initialState;
@@ -84,13 +252,18 @@ private:
     std::string _typeName = "";
     uint _subscribtionStringLen;
     T _lastState;
+    std::string _address;
 };
 
 template<class T>
 class Sender {
 public:
     typedef std::function<std::string(T)> TtoString;
-    Sender(): _publisher(*context) {
+
+    Sender(const std::string & topic): Sender() {
+        setTopic(topic);
+    }
+    Sender(): _publisher(*AppIO::instance()->getContext()) {
         if (std::is_same<T, bool>::value) init(false, "bool", [this](const T & val){
             return "{\"val\":true}";
         });
@@ -106,13 +279,16 @@ public:
         else throw "Unknown type in sender declared in default constructor";
     }
     void setTopic(const std::string & topic) {
-        _topic = topic;
+        auto myApp = AppIO::instance();
+        _topic = _typeName+"."+myApp->getAppNameAndInstance()+"."+topic;
     }
     void send(const T & val) {
+        _lastState = val;
         auto strToSend = _topic+_toString(val);
         std::cout << "publishing " << strToSend << "\n";
         _publisher.send(asio::buffer(strToSend));
     }
+    T getState() { return _lastState; }
 private:
     void init(T initialState, std::string typeName, TtoString toString) {
         _lastState = initialState;
@@ -131,54 +307,34 @@ private:
 
 
 int main(int argc, char** argv) {
-    asio::io_context io_context(1);
 
-    std::cout << "appname: " << argv[0] << '\n';
-//    std::cout << "current path is: " << std::experimental::filesystem::current_path() << '\n';
+    auto myApp = AppIO::instance();
+    myApp->initialize(argc, argv);
 
-
-    Receiver<bool> boolReceiver;
-    boolReceiver.subscribeTo("NASDAQ");
+    Receiver<bool> boolReceiver("whazza");
+    boolReceiver.subscribeTo("bool.readme/default.NASDAQ");
     boolReceiver.setCallback([](bool state){
         std::cout << "\n\n\n state is " << state << "\n\n\n";
     });
 
+    Sender<bool> boolSender("NASDAQ");
 
 
-//    azmq::sub_socket subscriber(*context);
-//    subscriber.connect("tcp://127.0.0.1:7721");
-//    subscriber.set_option(azmq::socket::subscribe("NASDAQ"));
-
-//    std::array<char, 256> buf_{};
-//    subscriber.async_receive(asio::buffer(buf_), [&buf_](boost::system::error_code const& ec, size_t bytes_transferred) {
-//        if (ec) return;
-//        auto output = boost::string_ref(buf_.data(), bytes_transferred - 1);
-//        std::cout << "got new async receive with data: " << output << "\n";
-//    });
-
-//    azmq::pub_socket publisher(*context);
-//    publisher.bind("tcp://127.0.0.1:7721");
-
-    Sender<bool> boolSender;
-    boolSender.setTopic("NASDAQ");
-
-
-    asio::steady_timer t(*context, boost::asio::chrono::seconds(1));
+    asio::steady_timer t(*myApp->getContext(), boost::asio::chrono::seconds(1));
 
     auto onTimeout = [&boolSender](boost::system::error_code const& ec){
         std::cout << "got new time interval publishing data\n";
-//        publisher.send(asio::buffer("NASDAQ{\"val\":true}"));
         boolSender.send(true);
     };
 
     t.async_wait(onTimeout);
 
-    boost::asio::signal_set signals(*context, SIGINT, SIGTERM);
-    signals.async_wait( [](auto, auto){
-        context->stop();
+    boost::asio::signal_set signals(*myApp->getContext(), SIGINT, SIGTERM);
+    signals.async_wait( [myApp](auto, auto){
+        myApp->getContext()->stop();
         std::cout << " deinitializing\n";
     });
-    context->run();
+    myApp->getContext()->run();
 
     return 0;
 }
